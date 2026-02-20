@@ -11,10 +11,9 @@ wheels/
 
 # logs
 *.log
-*.txt
 output/
+pedagogy/
 
 # artifacts
-*.png
 *.csv
 *.xlsx
