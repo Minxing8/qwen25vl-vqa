@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+import argparse, os, csv, sys
+from typing import List
+from tqdm import tqdm
+from PIL import Image
+import torch
+
+# HF Transformers + Qwen utils
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+
+def find_files(root: str, exts: List[str]) -> List[str]:
+    paths = []
+    for r, _, files in os.walk(root):
+        for f in files:
+            if f.lower().endswith(tuple(exts)):
+                paths.append(os.path.join(r, f))
+    paths.sort()
+    return paths
+
+def main():
+    p = argparse.ArgumentParser(description="Qwen2.5-VL Image VQA (batched)")
+    p.add_argument("--image_dir", required=True, help="Directory with images (recursively).")
+    p.add_argument("--output_dir", default="qwen25vl_img_vqa", help="Where to save results.")
+    p.add_argument("--questions", nargs="+", default=["Describe the image."], help="List of questions.")
+    p.add_argument("--num_samples", type=int, default=None, help="Cap number of images.")
+    p.add_argument("--batch_size", type=int, default=8, help="Batch size for images.")
+    p.add_argument("--model_name", default="Qwen/Qwen2.5-VL-7B-Instruct", help="HF model id or local path.")
+    p.add_argument("--max_new_tokens", type=int, default=200)
+    p.add_argument("--temperature", type=float, default=0.7)
+    p.add_argument("--top_p", type=float, default=0.9)
+    p.add_argument("--top_k", type=int, default=50)
+    p.add_argument("--repetition_penalty", type=float, default=1.05)
+    p.add_argument("--min_pixels", type=int, default=None, help="Override processor min_pixels.")
+    p.add_argument("--max_pixels", type=int, default=None, help="Override processor max_pixels.")
+    p.add_argument("--dtype", default="auto", help="Torch dtype: auto|bfloat16|float16")
+    p.add_argument("--flash_attn2", action="store_true", help="Enable Flash-Attention 2.")
+    p.add_argument("--device_map", default="auto", help="HF device map: auto|cuda|cpu")
+    args = p.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Select dtype
+    dtype = "auto"
+    if args.dtype.lower() in ["bfloat16", "bf16"]:
+        dtype = torch.bfloat16
+    elif args.dtype.lower() in ["float16", "fp16", "half"]:
+        dtype = torch.float16
+
+    # Processor (optional pixel controls)
+    proc_kwargs = {}
+    if args.min_pixels is not None: proc_kwargs["min_pixels"] = args.min_pixels
+    if args.max_pixels is not None: proc_kwargs["max_pixels"] = args.max_pixels
+    processor = AutoProcessor.from_pretrained(args.model_name, **proc_kwargs)
+
+    # Model
+    attn_impl = "flash_attention_2" if args.flash_attn2 else "sdpa"
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        args.model_name,
+        torch_dtype=dtype,
+        attn_implementation=attn_impl,
+        device_map=args.device_map,
+    )
+    device = model.device
+    print(f"Loaded model on {device}; dtype={model.dtype}; flash_attn2={args.flash_attn2}")
+
+    # Gather images
+    image_paths = find_files(args.image_dir, ["jpg", "jpeg", "png", "webp", "bmp"])
+    if args.num_samples is not None:
+        image_paths = image_paths[:args.num_samples]
+    print(f"Total images: {len(image_paths)}")
+
+    # Helper to load PIL images
+    def load_images(paths: List[str]) -> List[Image.Image]:
+        imgs = []
+        for pth in paths:
+            try:
+                imgs.append(Image.open(pth).convert("RGB"))
+            except Exception as e:
+                print(f"[WARN] Failed to open {pth}: {e}")
+                imgs.append(None)
+        return imgs
+
+    # Loop over questions
+    gen_kwargs = dict(
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        repetition_penalty=args.repetition_penalty,
+    )
+
+    for q_idx, question in enumerate(args.questions, start=1):
+        print(f"\n[Q{q_idx}] {question}")
+        q_out_dir = os.path.join(args.output_dir, f"question_{q_idx}")
+        os.makedirs(q_out_dir, exist_ok=True)
+        csv_path = os.path.join(q_out_dir, "results.csv")
+        empty_log = os.path.join(q_out_dir, "empty_answers.log")
+
+        with open(csv_path, "w", newline="", encoding="utf-8") as fcsv, \
+             open(empty_log, "w", encoding="utf-8") as flog:
+
+            writer = csv.DictWriter(fcsv, fieldnames=["filename", "answer"])
+            writer.writeheader()
+            flog.write("Empty Answers Log\n=================\n")
+
+            for i in tqdm(range(0, len(image_paths), args.batch_size), desc=f"Q{q_idx}"):
+                batch_paths = image_paths[i:i+args.batch_size]
+                batch_imgs = load_images(batch_paths)
+
+                # Filter out None while preserving order; fallback with tiny white image if needed
+                imgs = []
+                valid_mask = []
+                for im in batch_imgs:
+                    if im is None:
+                        imgs.append(Image.new("RGB", (224, 224), (255, 255, 255)))
+                        valid_mask.append(False)
+                    else:
+                        imgs.append(im)
+                        valid_mask.append(True)
+
+                # Build chat messages per image
+                messages = []
+                for _ in imgs:
+                    messages.append({
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": ""},  # placeholder, images passed separately
+                            {"type": "text", "text": question},
+                        ],
+                    })
+
+                # Apply chat template per sample
+                texts = [processor.apply_chat_template([m], tokenize=False, add_generation_prompt=True)
+                         for m in messages]
+
+                inputs = processor(
+                    text=texts,
+                    images=imgs,
+                    padding=True,
+                    return_tensors="pt",
+                ).to(device)
+
+                with torch.no_grad():
+                    generated = model.generate(**inputs, **gen_kwargs)
+
+                # Slice new tokens beyond prompt
+                trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, generated)]
+                answers = processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+
+                # Post & write
+                for pth, ans, is_valid in zip(batch_paths, answers, valid_mask):
+                    ans = (ans or "").strip().replace("\n", " ")
+                    if not ans:
+                        flog.write(f"Empty answer for image: {pth}\n")
+                        ans = "No answer generated."
+                    if not is_valid:
+                        ans = f"[LOAD_ERROR] {ans}"
+                    writer.writerow({"filename": pth, "answer": ans})
+
+        print(f"[Saved] {csv_path}")
+
+    print("All questions processed.")
+
+if __name__ == "__main__":
+    main()

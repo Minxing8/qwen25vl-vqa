@@ -8,3 +8,12 @@ wheels/
 
 # venv
 .venv
+
+# logs
+.log
+.txt
+output/
+
+# artifacts
+.png
+.csv
