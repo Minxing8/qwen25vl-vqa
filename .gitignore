@@ -10,11 +10,11 @@ wheels/
 .venv
 
 # logs
-.log
-.txt
+*.log
+*.txt
 output/
 
 # artifacts
-.png
-.csv
-.xlsx
+*.png
+*.csv
+*.xlsx
